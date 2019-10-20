@@ -1,0 +1,14 @@
+input:
+  file: examples/dallas_pm.log
+  has_headers: true
+  delimiter: ";"
+
+output:
+  file: examples/dallas_pm.prom
+  prefix: "dallas_"
+  numeric_values_only: true
+
+fields:
+  include: [name: .*]
+  exclude: []
+
