@@ -1,0 +1,10 @@
+input:
+  file: examples/basic/input.csv
+  has_headers: true
+
+output:
+  file: examples/basic/output.prom
+  prefix: "basic_"
+  numeric_values_only: true
+
+

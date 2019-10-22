@@ -1,11 +1,12 @@
-use std::error::Error;
-use log::{error, warn};
-use serde::Deserialize;
-use std::io::{BufReader, Write};
-use std::fs::File;
+use inotify::{Inotify, WatchMask};
+use log::{debug, error, warn};
 use regex::Regex;
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufReader, Write};
 use std::iter::Iterator;
+use std::path::PathBuf;
 
 const USAGE: &'static str = "Usage: prometheus-csv-adapter <config>\n";
 
@@ -25,16 +26,19 @@ fn main() {
                 let cfg: Config = match serde_yaml::from_str(&s) {
                     Ok(c) => c,
                     Err(e) => {
-                        error!("Failed to parse the config: {}", e);
+                        error!("failed to parse the config: {}", e);
                         std::process::exit(1);
                     }
                 };
-                if let Err(e) = run(&cfg) {
+                if let Err(e) = run_once(&cfg) {
                     error!("{}", e);
                 }
+                // continuously monitor the input file and
+                // run the main logic when a change is detected
+                run_when_file_is_modified(&cfg);
             }
             Err(e) => {
-                error!("Failed to read the config: {}", e);
+                error!("failed to read the config: {}", e);
                 std::process::exit(1);
             }
         }
@@ -65,7 +69,6 @@ struct Output {
     numeric_values_only: bool,
 }
 
-
 #[derive(Debug, Deserialize)]
 struct Fields {
     include: Vec<Field>,
@@ -78,8 +81,8 @@ struct Field {
     name: Regex,
 }
 
-
-fn run(cfg: &Config) -> Result<(), Box<dyn Error>> {
+fn run_once(cfg: &Config) -> Result<(), Box<dyn Error>> {
+    debug!("parsing {:?}", cfg.input.file);
     // Open the input file and read it line by line
     let ifile = File::open(&cfg.input.file)?;
     let reader = BufReader::new(ifile);
@@ -90,11 +93,14 @@ fn run(cfg: &Config) -> Result<(), Box<dyn Error>> {
         None => b',',
     };
 
-    let mut rdr = csv::ReaderBuilder::new().has_headers(cfg.input.has_headers).delimiter(delimiter).from_reader(reader);
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(cfg.input.has_headers)
+        .delimiter(delimiter)
+        .from_reader(reader);
 
     // we only care about the last line (newest records)
-    if let Some(last)= rdr.records().last() {
-        // The reader iterator yields Result<StringRecord, Error>, so we check the error here.
+    if let Some(last) = rdr.records().last() {
+        // The reader iterator yields Result<StringRecord, Error>, so we check the error here
         let records = last?;
         let headers = rdr.headers()?;
 
@@ -102,34 +108,72 @@ fn run(cfg: &Config) -> Result<(), Box<dyn Error>> {
         for (header, value) in headers.iter().zip(records.iter()) {
             if cfg.output.numeric_values_only {
                 if value.parse::<f64>().is_err() {
-                    warn!("Skipping record '{}' as the corresponding value is not numeric: {}", header, value);
-                    ofile.write_fmt(format_args!("# {} {}\n", header, value))?;
+                    warn!(
+                        "skipping record '{}' as the corresponding value is not numeric: {}",
+                        header, value
+                    );
+                    ofile.write_fmt(format_args!("# skipped: '{}' '{}'\n\n", header, value))?;
                     continue;
                 }
             }
             ofile.write_fmt(format_args!("# {}\n", header))?;
-            ofile.write_fmt(format_args!("{}{}  {}\n\n", cfg.output.prefix, normalize_string(header), value))?;
+            ofile.write_fmt(format_args!(
+                "{}{}  {}\n\n",
+                cfg.output.prefix,
+                normalize_string(header),
+                value
+            ))?;
         }
+        debug!("output saved to {:?}", cfg.output.file);
     }
     Ok(())
 }
 
+// monitor the input file using inotify and reconfigure bird when the config was changed
+fn run_when_file_is_modified(cfg: &Config) {
+    debug!("monitoring {:?} for changes", cfg.input.file);
+
+    let mut inotify = Inotify::init().expect("failed to initialize inotify");
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        // add the watch inside a loop to avoid issues where
+        // inotify reports only the first change
+        inotify
+            .add_watch(&cfg.input.file, WatchMask::MODIFY)
+            .expect("failed to add file watch");
+
+        let _ = inotify
+            .read_events_blocking(&mut buffer)
+            .expect("failed to read inotify events");
+
+        // update the running config when inotify received an event (the thread was unblocked)
+        debug!("change detected in {:?}", cfg.input.file);
+        if let Err(e) = run_once(&cfg) {
+            error!("failed to generate the output: {}", e);
+        }
+    }
+}
 
 // replace spaces, - and () from the input string with _
 fn normalize_string(s: &str) -> String {
     let mut v = vec![];
-    let mut prev_c = None;
-    for (i, c) in s.chars().enumerate() {
+    let mut prev_c = '_';
+    for c in s.chars() {
         if c.is_alphanumeric() {
-            v.push(c.to_ascii_lowercase());
-            prev_c = None;
+            prev_c = c.to_ascii_lowercase();
+            v.push(prev_c);
         } else {
-            // don't replace at start of string and if there was a replacement before
-            if i > 0 && prev_c != Some('_') {
+            // don't replace at start and end of string and if there was a replacement before
+            if prev_c != '_' {
                 v.push('_');
-                prev_c = Some('_')
+                prev_c = '_';
             }
         }
+    }
+    // remove the trailing _
+    if v.last() == Some(&'_') {
+        v.pop();
     }
     v.iter().collect()
 }
