@@ -7,8 +7,4 @@ output:
   file: examples/dallas_pm.prom
   prefix: "dallas_"
   numeric_values_only: true
-
-fields:
-  include: [name: .*]
-  exclude: []
-
+  skip_duplicate_headers: true

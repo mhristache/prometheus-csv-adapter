@@ -6,5 +6,5 @@ output:
   file: examples/basic/output.prom
   prefix: "basic_"
   numeric_values_only: true
-
+  skip_duplicate_headers: true
 

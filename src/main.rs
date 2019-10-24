@@ -65,8 +65,12 @@ struct Input {
 #[derive(Debug, Deserialize)]
 struct Output {
     file: PathBuf,
+    #[serde(default)]
     prefix: String,
+    #[serde(default)]
     numeric_values_only: bool,
+    #[serde(default)]
+    skip_duplicate_headers: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +107,19 @@ fn run_once(cfg: &Config) -> Result<(), Box<dyn Error>> {
         // The reader iterator yields Result<StringRecord, Error>, so we check the error here
         let records = last?;
         let headers = rdr.headers()?;
-
+        let mut seen_headers: Vec<&str> = vec![];
         let mut ofile = File::create(&cfg.output.file)?;
         for (header, value) in headers.iter().zip(records.iter()) {
+            if cfg.output.skip_duplicate_headers {
+                if seen_headers.contains(&header) {
+                    warn!(
+                        "skipping duplicate header '{}'", header
+                    );
+                    ofile.write_fmt(format_args!("# skipped: '{}' '{}'\n\n", header, value))?;
+                    continue
+                }
+                seen_headers.push(header);
+            }
             if cfg.output.numeric_values_only {
                 if value.parse::<f64>().is_err() {
                     warn!(
