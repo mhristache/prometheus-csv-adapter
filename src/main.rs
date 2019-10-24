@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::iter::Iterator;
 use std::path::PathBuf;
+use std::thread::sleep;
+use std::time::Duration;
 
 const USAGE: &'static str = "Usage: prometheus-csv-adapter <config>\n";
 
@@ -31,7 +33,7 @@ fn main() {
                     }
                 };
                 if let Err(e) = run_once(&cfg) {
-                    error!("{}", e);
+                    error!("first run failed: {}", e);
                 }
                 // continuously monitor the input file and
                 // run the main logic when a change is detected
@@ -112,11 +114,9 @@ fn run_once(cfg: &Config) -> Result<(), Box<dyn Error>> {
         for (header, value) in headers.iter().zip(records.iter()) {
             if cfg.output.skip_duplicate_headers {
                 if seen_headers.contains(&header) {
-                    warn!(
-                        "skipping duplicate header '{}'", header
-                    );
+                    warn!("skipping duplicate header '{}'", header);
                     ofile.write_fmt(format_args!("# skipped: '{}' '{}'\n\n", header, value))?;
-                    continue
+                    continue;
                 }
                 seen_headers.push(header);
             }
@@ -153,18 +153,26 @@ fn run_when_file_is_modified(cfg: &Config) {
     loop {
         // add the watch inside a loop to avoid issues where
         // inotify reports only the first change
-        inotify
-            .add_watch(&cfg.input.file, WatchMask::MODIFY)
-            .expect("failed to add file watch");
-
-        let _ = inotify
-            .read_events_blocking(&mut buffer)
-            .expect("failed to read inotify events");
-
-        // update the running config when inotify received an event (the thread was unblocked)
-        debug!("change detected in {:?}", cfg.input.file);
-        if let Err(e) = run_once(&cfg) {
-            error!("failed to generate the output: {}", e);
+        match inotify.add_watch(&cfg.input.file, WatchMask::MODIFY) {
+            Err(e) => {
+                error!("failed to add inotify watch of {:?}: {}", cfg.input.file, e);
+                sleep(Duration::from_secs(10));
+            }
+            _ => match inotify.read_events_blocking(&mut buffer) {
+                Err(e) => {
+                    error!("failed to read inotify events: {}", e);
+                    sleep(Duration::from_secs(10));
+                }
+                _ => {
+                    // update the running config when inotify received an event
+                    // (the thread was unblocked)
+                    debug!("change detected in {:?}", cfg.input.file);
+                    if let Err(e) = run_once(&cfg) {
+                        error!("failed to generate the output: {}", e);
+                        sleep(Duration::from_secs(10));
+                    }
+                }
+            },
         }
     }
 }
