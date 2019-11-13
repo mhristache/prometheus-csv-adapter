@@ -3,8 +3,7 @@ input:
   has_headers: true
 
 output:
-  file: examples/basic/output.prom
+  socket: "0.0.0.0:58888"
   prefix: "basic_"
   numeric_values_only: true
   skip_duplicate_headers: true
-

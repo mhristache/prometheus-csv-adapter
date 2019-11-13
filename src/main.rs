@@ -1,5 +1,4 @@
-use inotify::{Inotify, WatchMask};
-use log::{debug, error, warn};
+use log::{debug, error, warn, info};
 use regex::Regex;
 use serde::Deserialize;
 use std::error::Error;
@@ -7,8 +6,8 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::iter::Iterator;
 use std::path::PathBuf;
-use std::thread::sleep;
-use std::time::Duration;
+use std::net::SocketAddr;
+use tiny_http::{Server, Response, Method};
 
 const USAGE: &'static str = "Usage: prometheus-csv-adapter <config>\n";
 
@@ -32,12 +31,28 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                if let Err(e) = run_once(&cfg) {
-                    error!("first run failed: {}", e);
+                // start the server
+                info!("starting the web server on {}", cfg.output.socket);
+                let server = Server::http(cfg.output.socket).expect("failed to start the http server");
+
+                for rq in server.incoming_requests() {
+                    info!("received request! method: {:?}, url: {:?}", rq.method(), rq.url());
+                    if rq.url() != "/metrics" {
+                        let _ = rq.respond(Response::empty(404));
+                    } else if rq.method() != &Method::Get {
+                        let _ = rq.respond(Response::empty(405));
+                    } else {
+                        match gen_response(&cfg) {
+                            Ok(s) => {
+                                let _ = rq.respond(Response::from_string(s));
+                            },
+                            Err(_) => {
+                                let _ = rq.respond(Response::empty(500));
+                            },
+                        }
+                    }
+
                 }
-                // continuously monitor the input file and
-                // run the main logic when a change is detected
-                run_when_file_is_modified(&cfg);
             }
             Err(e) => {
                 error!("failed to read the config: {}", e);
@@ -66,7 +81,7 @@ struct Input {
 
 #[derive(Debug, Deserialize)]
 struct Output {
-    file: PathBuf,
+    socket: SocketAddr,
     #[serde(default)]
     prefix: String,
     #[serde(default)]
@@ -87,7 +102,8 @@ struct Field {
     name: Regex,
 }
 
-fn run_once(cfg: &Config) -> Result<(), Box<dyn Error>> {
+// convert the input csv file into a string with prometheus metrics
+fn gen_response(cfg: &Config) -> Result<String, Box<dyn Error>> {
     debug!("parsing {:?}", cfg.input.file);
     // Open the input file and read it line by line
     let ifile = File::open(&cfg.input.file)?;
@@ -104,18 +120,18 @@ fn run_once(cfg: &Config) -> Result<(), Box<dyn Error>> {
         .delimiter(delimiter)
         .from_reader(reader);
 
+    let mut res = String::new();
     // we only care about the last line (newest records)
     if let Some(last) = rdr.records().last() {
         // The reader iterator yields Result<StringRecord, Error>, so we check the error here
         let records = last?;
         let headers = rdr.headers()?;
         let mut seen_headers: Vec<&str> = vec![];
-        let mut ofile = File::create(&cfg.output.file)?;
         for (header, value) in headers.iter().zip(records.iter()) {
             if cfg.output.skip_duplicate_headers {
                 if seen_headers.contains(&header) {
                     warn!("skipping duplicate header '{}'", header);
-                    ofile.write_fmt(format_args!("# skipped: '{}' '{}'\n\n", header, value))?;
+                    res.push_str(&*format!("# skipped: '{}' '{}'\n\n", header, value));
                     continue;
                 }
                 seen_headers.push(header);
@@ -126,55 +142,20 @@ fn run_once(cfg: &Config) -> Result<(), Box<dyn Error>> {
                         "skipping record '{}' as the corresponding value is not numeric: {}",
                         header, value
                     );
-                    ofile.write_fmt(format_args!("# skipped: '{}' '{}'\n\n", header, value))?;
+                    res.push_str(&*format!("# skipped: '{}' '{}'\n\n", header, value));
                     continue;
                 }
             }
-            ofile.write_fmt(format_args!("# {}\n", header))?;
-            ofile.write_fmt(format_args!(
+            res.push_str(&*format!("# {}\n", header));
+            res.push_str(&*format!(
                 "{}{}  {}\n\n",
                 cfg.output.prefix,
                 normalize_string(header),
                 value
-            ))?;
-        }
-        debug!("output saved to {:?}", cfg.output.file);
-    }
-    Ok(())
-}
-
-// monitor the input file using inotify and reconfigure bird when the config was changed
-fn run_when_file_is_modified(cfg: &Config) {
-    debug!("monitoring {:?} for changes", cfg.input.file);
-
-    let mut inotify = Inotify::init().expect("failed to initialize inotify");
-    let mut buffer = [0u8; 4096];
-
-    loop {
-        // add the watch inside a loop to avoid issues where
-        // inotify reports only the first change
-        match inotify.add_watch(&cfg.input.file, WatchMask::MODIFY) {
-            Err(e) => {
-                error!("failed to add inotify watch of {:?}: {}", cfg.input.file, e);
-                sleep(Duration::from_secs(10));
-            }
-            _ => match inotify.read_events_blocking(&mut buffer) {
-                Err(e) => {
-                    error!("failed to read inotify events: {}", e);
-                    sleep(Duration::from_secs(10));
-                }
-                _ => {
-                    // update the running config when inotify received an event
-                    // (the thread was unblocked)
-                    debug!("change detected in {:?}", cfg.input.file);
-                    if let Err(e) = run_once(&cfg) {
-                        error!("failed to generate the output: {}", e);
-                        sleep(Duration::from_secs(10));
-                    }
-                }
-            },
+            ));
         }
     }
+    Ok(res)
 }
 
 // replace spaces, - and () from the input string with _
