@@ -8,6 +8,10 @@ use std::iter::Iterator;
 use std::path::PathBuf;
 use std::net::SocketAddr;
 use tiny_http::{Server, Response, Method};
+use std::time::Duration;
+use inotify::{Inotify, WatchMask};
+use std::thread::{sleep, self};
+use std::sync::{Arc, Mutex};
 
 const USAGE: &'static str = "Usage: prometheus-csv-adapter <config>\n";
 
@@ -31,9 +35,13 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
+                let socket = cfg.output.socket.clone();
+                let mut prom = Prom::new(cfg);
+                prom.monitor_input();
+
                 // start the server
-                info!("starting the web server on {}", cfg.output.socket);
-                let server = Server::http(cfg.output.socket).expect("failed to start the http server");
+                info!("starting the web server on {}", socket);
+                let server = Server::http(socket).expect("failed to start the http server");
 
                 for rq in server.incoming_requests() {
                     info!("received request! method: {:?}, url: {:?}", rq.method(), rq.url());
@@ -42,11 +50,11 @@ fn main() {
                     } else if rq.method() != &Method::Get {
                         let _ = rq.respond(Response::empty(405));
                     } else {
-                        match gen_response(&cfg) {
-                            Ok(s) => {
+                        match prom.gen_output() {
+                            Some(s) => {
                                 let _ = rq.respond(Response::from_string(s));
                             },
-                            Err(_) => {
+                            None => {
                                 let _ = rq.respond(Response::empty(500));
                             },
                         }
@@ -102,8 +110,91 @@ struct Field {
     name: Regex,
 }
 
+struct Prom {
+    content: Arc<Mutex<Option<String>>>,
+    cfg: Arc<Config>,
+}
+
+impl Prom {
+    fn new(cfg: Config) -> Self {
+        let content = match parse_input(&cfg) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!("failed to parse the input: {}", e);
+                None
+            }
+        };
+        Self {
+            content: Arc::new(Mutex::new(content)),
+            cfg: Arc::new(cfg),
+        }
+    }
+
+    fn gen_output(&mut self) -> Option<String> {
+        let mut content = self.content.lock().expect("mutex was poisoned");
+        if content.is_none() {
+            debug!("generating fresh output");
+            match parse_input(&self.cfg) {
+                Ok(s) => {
+                    *content = Some(s);
+                },
+                Err(e) => {
+                    error!("failed to parse the input: {}", e);
+                    return None;
+                }
+            }
+        }
+        content.clone()
+    }
+
+    // monitor input file and update the content when a change is detected
+    fn monitor_input(&mut self) {
+        debug!("running monitoring thread");
+        let content = self.content.clone();
+        let cfg = self.cfg.clone();
+        thread::spawn(move || {
+            debug!("monitoring {:?} for changes", cfg.input.file);
+
+            let mut inotify = Inotify::init().expect("failed to initialize inotify");
+            let mut buffer = [0u8; 4096];
+
+            loop {
+                // add the watch inside a loop to avoid issues where
+                // inotify reports only the first change
+                match inotify.add_watch(&cfg.input.file, WatchMask::MODIFY) {
+                    Err(e) => {
+                        error!("failed to add inotify watch of {:?}: {}", cfg.input.file, e);
+                        sleep(Duration::from_secs(10));
+                    }
+                    _ => match inotify.read_events_blocking(&mut buffer) {
+                        Err(e) => {
+                            error!("failed to read inotify events: {}", e);
+                            sleep(Duration::from_secs(10));
+                        }
+                        _ => {
+                            // update the running config when inotify received an event
+                            // (the thread was unblocked)
+                            debug!("change detected in {:?}", cfg.input.file);
+                            match parse_input(&cfg) {
+                                Ok(s) => {
+                                    let mut content = content.lock().expect("mutex was poisoned");
+                                    *content = Some(s);
+                                },
+                                Err(e) => {
+                                    error!("failed to generate the output: {}", e);
+                                    sleep(Duration::from_secs(10));
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        });
+    }
+}
+
 // convert the input csv file into a string with prometheus metrics
-fn gen_response(cfg: &Config) -> Result<String, Box<dyn Error>> {
+fn parse_input(cfg: &Config) -> Result<String, Box<dyn Error>> {
     debug!("parsing {:?}", cfg.input.file);
     // Open the input file and read it line by line
     let ifile = File::open(&cfg.input.file)?;
@@ -157,6 +248,7 @@ fn gen_response(cfg: &Config) -> Result<String, Box<dyn Error>> {
     }
     Ok(res)
 }
+
 
 // replace spaces, - and () from the input string with _
 fn normalize_string(s: &str) -> String {
